@@ -2,8 +2,12 @@ import warnings
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import matplotlib
+import matplotlib.pyplot as plt
 from pathlib import Path
 from statsmodels.tsa.stattools import coint, adfuller
+
+matplotlib.use("Agg")
 
 warnings.filterwarnings("ignore")
 
@@ -148,6 +152,76 @@ def backtest_pair(p1, p2):
     return pd.Series(pnl_all, dtype=float), stability_rows
 
 
+def plot_zscore_chart(p1, p2, pair_label, out_path):
+    """Walk-forward z-score chart for a single pair — cointegrated windows only."""
+    n = len(p1)
+    dates, zscores, positions = [], [], []
+
+    for train_end in range(LOOKBACK, n - FORWARD + 1, FORWARD):
+        train1 = p1.iloc[train_end - LOOKBACK : train_end]
+        train2 = p2.iloc[train_end - LOOKBACK : train_end]
+        test1  = p1.iloc[train_end : train_end + FORWARD]
+        test2  = p2.iloc[train_end : train_end + FORWARD]
+
+        _, eg_pvalue, _ = coint(train1, train2)
+        if eg_pvalue >= 0.05:
+            continue
+
+        spread_train, beta = calc_spread(train1, train2)
+        spread_test = test1 - beta * test2
+        z = zscore(spread_test)
+
+        position = 0
+        for i in range(1, len(z)):
+            zi = z.iloc[i - 1]
+            if position == 0:
+                if zi > ENTRY_Z:
+                    position = -1
+                elif zi < -ENTRY_Z:
+                    position = 1
+            elif position == 1  and zi >= EXIT_Z:
+                position = 0
+            elif position == -1 and zi <= EXIT_Z:
+                position = 0
+            dates.append(z.index[i])
+            zscores.append(z.iloc[i])
+            positions.append(position)
+
+    if not dates:
+        return
+
+    dates     = pd.DatetimeIndex(dates)
+    zscores   = np.array(zscores)
+    positions = np.array(positions)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    ax.plot(dates, zscores, color="#444444", linewidth=0.9, zorder=2)
+    ax.fill_between(dates, zscores, 0,
+                    where=(positions == 1),
+                    color="#27ae60", alpha=0.35, label="Long spread", zorder=1)
+    ax.fill_between(dates, zscores, 0,
+                    where=(positions == -1),
+                    color="#c0392b", alpha=0.35, label="Short spread", zorder=1)
+
+    ax.axhline( ENTRY_Z, color="#c0392b", linestyle="--", linewidth=1.1,
+                label=f"+{ENTRY_Z}\u03c3 entry (short)")
+    ax.axhline(-ENTRY_Z, color="#27ae60", linestyle="--", linewidth=1.1,
+                label=f"\u2212{ENTRY_Z}\u03c3 entry (long)")
+    ax.axhline(0, color="#999999", linestyle=":", linewidth=0.8)
+
+    ax.set_title(f"{pair_label}  —  Spread Z-Score, Walk-Forward Out-of-Sample Windows",
+                 fontsize=13, pad=10)
+    ax.set_ylabel("Z-Score  (spread std devs from training mean)")
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.8)
+    ax.grid(axis="y", alpha=0.25)
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Chart     → {out_path}")
+
+
 def run():
     REPORTS.mkdir(exist_ok=True)
 
@@ -175,6 +249,10 @@ def run():
         for row in stab:
             row["pair"] = f"{ticker1}/{ticker2}"
         all_stability.extend(stab)
+
+        if ticker1 == "XOM" and ticker2 == "CVX":
+            plot_zscore_chart(p1, p2, f"{ticker1}/{ticker2}",
+                              REPORTS / "xom_cvx_zscore.png")
 
         if len(pnl) == 0:
             print("    no trades (no cointegrated windows)")
